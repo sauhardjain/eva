@@ -9,6 +9,8 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
+from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
+
 from eva.assistant.agentic.audit_log import (
     AuditLog,
     ConversationMessage,
@@ -17,6 +19,7 @@ from eva.assistant.agentic.audit_log import (
 )
 from eva.assistant.tools.tool_executor import ToolExecutor
 from eva.models.agents import AgentConfig
+from eva.utils.conversation_checks import LLM_GENERIC_ERROR_MESSAGE as GENERIC_ERROR
 from eva.utils.error_handler import categorize_error
 from eva.utils.log_processing import truncate_data_uris
 from eva.utils.logging import get_logger
@@ -26,9 +29,6 @@ logger = get_logger(__name__)
 
 # Suppress LiteLLM's Pydantic serialization warnings (harmless internal warnings)
 warnings.filterwarnings("ignore", category=UserWarning, message=".*Pydantic serializer warnings.*")
-
-# Response messages
-GENERIC_ERROR = "I'm sorry, I encountered an error processing your request."
 
 
 def _clean_tool_name(name: str) -> str:
@@ -44,6 +44,46 @@ def _clean_tool_name(name: str) -> str:
         logger.warning(f"Harmony token leak in tool name: {name!r} → {cleaned!r}")
         return cleaned
     return name
+
+
+def _pair_orphaned_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Add neutral tool results for tool calls left unanswered by interruption or transfer paths."""
+    repaired: list[dict[str, Any]] = []
+    i = 0
+    n = len(messages)
+    while i < n:
+        msg = messages[i]
+        repaired.append(msg)
+        tool_calls = msg.get("tool_calls") if msg.get("role") == "assistant" else None
+        if tool_calls:
+            call_ids = [
+                cid for tc in tool_calls if isinstance(tc, dict) and isinstance((cid := tc.get("id")), str) and cid
+            ]
+            answered: set[str] = set()
+            j = i + 1
+            while j < n and messages[j].get("role") == "tool":
+                repaired.append(messages[j])
+                if isinstance(tool_call_id := messages[j].get("tool_call_id"), str):
+                    answered.add(tool_call_id)
+                j += 1
+            for cid in call_ids:
+                if cid not in answered:
+                    logger.warning(
+                        f"Pairing orphaned tool_call {cid} with a synthetic result (interrupted/transferred)"
+                    )
+                    repaired.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": cid,
+                            "content": json.dumps(
+                                {"status": "no_result", "note": "tool result unavailable (interrupted or transferred)"}
+                            ),
+                        }
+                    )
+            i = j
+            continue
+        i += 1
+    return repaired
 
 
 class AgenticSystem:
@@ -64,6 +104,8 @@ class AgenticSystem:
         audit_log: AuditLog,
         llm_client: Any,  # LLM client for model calls
         output_dir: Path | None = None,  # Output directory for performance stats
+        pre_tool_speech: str = "off",
+        llm_streaming: bool = False,
     ):
         """Initialize the agentic system.
 
@@ -74,6 +116,8 @@ class AgenticSystem:
             audit_log: Audit log for conversation tracking
             llm_client: Client for LLM calls
             output_dir: Optional output directory for saving performance stats
+            pre_tool_speech: Lead-in mode ('off'|'auto')
+            llm_streaming: Stream LLM output sentence-by-sentence
         """
         self.agent = agent
         self.tool_handler = tool_handler
@@ -81,6 +125,9 @@ class AgenticSystem:
         self.llm_client = llm_client
         self.output_dir = output_dir
         self.current_date_time = current_date_time
+        self.pre_tool_speech = pre_tool_speech
+        self.llm_streaming = llm_streaming
+        self._warned_responses_streaming_fallback = False
 
         self.prompt_manager = PromptManager()
 
@@ -94,8 +141,17 @@ class AgenticSystem:
             agent_instructions=agent.instructions,
             datetime=self.current_date_time,
         )
+        if self.pre_tool_speech == "auto":
+            self.system_prompt += "\n\n" + self.prompt_manager.get_prompt("agent.pre_tool_speech")
         # Build tools for the LLM
         self.tools = agent.build_tools_for_agent()
+
+    def _record_partial_streamed_output(self, chunks: list[str], reason: str) -> None:
+        partial = " ".join(chunk.strip() for chunk in chunks if chunk.strip())
+        if not partial:
+            return
+        logger.info(f"Recording partial streamed assistant output after {reason}")
+        self.audit_log.append_assistant_output(partial)
 
     async def process_query(self, query: str) -> AsyncGenerator[str, None]:
         """Process a user query and yield response messages.
@@ -137,6 +193,7 @@ class AgenticSystem:
         # Add conversation history (includes current query since we already called append_user_input)
         conversation_history = self.audit_log.get_conversation_messages(max_messages=30)
         messages.extend(msg.to_dict() for msg in conversation_history)
+        messages = _pair_orphaned_tool_calls(messages)
 
         async for response in self._run_tool_loop(messages, agent):
             yield response
@@ -161,15 +218,42 @@ class AgenticSystem:
         # Tool calling loop (no max iterations)
         while True:
             start_time = str(int(time.time() * 1000))
+            streamed_chunks: list[str] = []
             try:
                 # Truncate data URIs for logging only (full audio stays in `messages`)
                 messages_for_log = truncate_data_uris(messages)
                 prompt_str = json.dumps(messages_for_log, indent=2, ensure_ascii=False)
 
-                response, llm_stats = await self.llm_client.complete(
-                    messages,
-                    tools=self.tools,
-                )
+                content_streamed = False
+                use_responses_api = getattr(self.llm_client, "use_responses_api", False)
+                if self.llm_streaming and use_responses_api and not self._warned_responses_streaming_fallback:
+                    logger.warning(
+                        "llm_streaming is not supported for Responses API deployments; using non-streaming completion."
+                    )
+                    self._warned_responses_streaming_fallback = True
+
+                if self.llm_streaming and not use_responses_api:
+                    response = None
+                    llm_stats = {}
+                    aggregator = SimpleTextAggregator()
+                    async for kind, payload in self.llm_client.complete_stream(messages, tools=self.tools):
+                        if kind == "delta":
+                            async for agg in aggregator.aggregate(payload):
+                                content_streamed = True
+                                streamed_chunks.append(agg.text)
+                                yield agg.text
+                        else:
+                            response, llm_stats = payload
+                    remainder = await aggregator.flush()
+                    if remainder and remainder.text.strip():
+                        content_streamed = True
+                        streamed_chunks.append(remainder.text)
+                        yield remainder.text
+                else:
+                    response, llm_stats = await self.llm_client.complete(
+                        messages,
+                        tools=self.tools,
+                    )
                 end_time = str(int(time.time() * 1000))
 
                 # Convert tool calls to dicts if present and extract content as string
@@ -223,8 +307,10 @@ class AgenticSystem:
                     "cost_source": llm_stats.get("cost_source", "unknown"),
                     "stop_reason": llm_stats.get("finish_reason", "unknown"),
                     "latency": llm_stats.get("latency", 0.0),
-                    "parameters": json.dumps(llm_stats.get("parameters", {})),
-                    "tool_calls": json.dumps(response_tool_calls_for_stats) if response_tool_calls_for_stats else "",
+                    "parameters": json.dumps(llm_stats.get("parameters", {}), ensure_ascii=False),
+                    "tool_calls": json.dumps(response_tool_calls_for_stats, ensure_ascii=False)
+                    if response_tool_calls_for_stats
+                    else "",
                     "reasoning": f'"{reasoning_content_for_csv}"',
                     "reasoning_tokens": reasoning_tokens,
                 }
@@ -256,6 +342,7 @@ class AgenticSystem:
 
             except asyncio.CancelledError:
                 # Pipeline is shutting down - log at debug and exit gracefully
+                self._record_partial_streamed_output(streamed_chunks, "cancellation")
                 logger.debug("LLM call cancelled during pipeline shutdown")
                 return  # Don't yield error message, just exit
             except Exception as e:
@@ -291,10 +378,13 @@ class AgenticSystem:
                         retry_attempt=0,
                     )
                     self.audit_log.append_llm_call(failed_llm_call, agent_name=agent.name)
-                    yield GENERIC_ERROR
+                    if streamed_chunks:
+                        self._record_partial_streamed_output(streamed_chunks, "streaming failure")
+                    else:
+                        yield GENERIC_ERROR
                 return
 
-            if response_content:
+            if response_content and not content_streamed:
                 logger.info(f"💬 Assistant LLM response: {response_content}")
                 yield response_content
 
@@ -334,7 +424,7 @@ class AgenticSystem:
 
                 # Log tool call
                 logger.info(f"🔧 Tool call: {tool_name}")
-                logger.info(f"   Parameters: {json.dumps(params, indent=2)}")
+                logger.info(f"   Parameters: {json.dumps(params, indent=2, ensure_ascii=False)}")
 
                 # Special handling for transfer to live agent
                 if tool_name == "transfer_to_agent":
@@ -356,7 +446,7 @@ class AgenticSystem:
                     logger.warning(f"❌ Tool error: {tool_name} - {result.get('message', 'Unknown error')}")
                 else:
                     logger.info(f"✅ Tool response: {tool_name}")
-                    logger.info(f"   Result: {json.dumps(result, indent=2)}")
+                    logger.info(f"   Result: {json.dumps(result, indent=2, ensure_ascii=False)}")
 
                 self.audit_log.append_tool_call(
                     tool_name=tool_name,
@@ -365,7 +455,7 @@ class AgenticSystem:
                 )
 
                 # Add tool response to messages
-                tool_content = json.dumps(result)
+                tool_content = json.dumps(result, ensure_ascii=False)
                 messages.append(
                     {
                         "role": "tool",

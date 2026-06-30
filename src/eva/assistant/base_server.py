@@ -21,11 +21,12 @@ from eva.assistant.tools.tool_executor import ToolExecutor
 from eva.models.agents import AgentConfig
 from eva.models.config import ModelConfig
 from eva.utils.audio_utils import save_pcm_as_wav
+from eva.utils.culture import get_initial_message
 from eva.utils.logging import get_logger
+from eva.utils.prompt_manager import PromptManager
 
 logger = get_logger(__name__)
 
-INITIAL_MESSAGE = "Hello! How can I help you today?"
 SAMPLE_RATE = 24000
 
 
@@ -50,6 +51,7 @@ class AbstractAssistantServer(ABC):
         output_dir: Path,
         port: int,
         conversation_id: str,
+        language: str = "en",
     ):
         """Initialize the assistant server.
 
@@ -62,9 +64,12 @@ class AbstractAssistantServer(ABC):
             output_dir: Directory for output files
             port: Port to listen on
             conversation_id: Unique ID for this conversation
+            language: BCP 47 language tag for STT/TTS/S2S services (e.g. 'en', 'fr', 'es-MX')
         """
         self.current_date_time = current_date_time
         self.pipeline_config = pipeline_config
+        self.language = language
+        self.initial_message = get_initial_message(language)
         self.agent: AgentConfig = agent
         self.agent_config_path = agent_config_path
         self.scenario_db_path = scenario_db_path
@@ -315,16 +320,29 @@ class AbstractAssistantServer(ABC):
         if mixed_audio or user_audio or assistant_audio:
             logger.info(f"Saved audio files to {self.output_dir} ({len(mixed_audio)} bytes mixed)")
 
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt for realtime/S2S assistant servers."""
+        prompt_manager = PromptManager()
+        prompt = prompt_manager.get_prompt(
+            "realtime_agent.system_prompt",
+            agent_personality=self.agent.description,
+            agent_instructions=self.agent.instructions,
+            datetime=self.current_date_time,
+        )
+        if self.pipeline_config.pre_tool_speech == "auto":
+            prompt += "\n\n" + prompt_manager.get_prompt("agent.pre_tool_speech")
+        return prompt
+
     def _save_scenario_dbs(self) -> None:
         """Save initial and final scenario database states."""
         try:
             initial_db_path = self.output_dir / "initial_scenario_db.json"
             with open(initial_db_path, "w") as f:
-                json.dump(self.get_initial_scenario_db(), f, indent=2, sort_keys=True, default=str)
+                json.dump(self.get_initial_scenario_db(), f, indent=2, sort_keys=True, default=str, ensure_ascii=False)
 
             final_db_path = self.output_dir / "final_scenario_db.json"
             with open(final_db_path, "w") as f:
-                json.dump(self.get_final_scenario_db(), f, indent=2, sort_keys=True, default=str)
+                json.dump(self.get_final_scenario_db(), f, indent=2, sort_keys=True, default=str, ensure_ascii=False)
 
             logger.info(f"Saved scenario database states to {self.output_dir}")
         except Exception as e:

@@ -26,9 +26,8 @@ from eva.assistant.audio_bridge import (
     pcm16_24k_to_mulaw_8k,
     sync_buffer_to_position,
 )
-from eva.assistant.base_server import INITIAL_MESSAGE, AbstractAssistantServer
+from eva.assistant.base_server import AbstractAssistantServer
 from eva.utils.logging import get_logger
-from eva.utils.prompt_manager import PromptManager
 
 logger = get_logger(__name__)
 
@@ -84,13 +83,7 @@ class OpenAIRealtimeAssistantServer(AbstractAssistantServer):
 
         self._audio_sample_rate = OPENAI_SAMPLE_RATE
 
-        prompt_manager = PromptManager()
-        self._system_prompt: str = prompt_manager.get_prompt(
-            "realtime_agent.system_prompt",
-            agent_personality=self.agent.description,
-            agent_instructions=self.agent.instructions,
-            datetime=self.current_date_time,
-        )
+        self._system_prompt: str = self._build_system_prompt()
 
         self._realtime_tools: list[dict] = self._build_realtime_tools()
 
@@ -218,6 +211,9 @@ class OpenAIRealtimeAssistantServer(AbstractAssistantServer):
         if reasoning_effort:
             session_config["reasoning"] = {"effort": reasoning_effort}
 
+        if self.pipeline_config.parallel_tool_calls is not None:
+            session_config["parallel_tool_calls"] = self.pipeline_config.parallel_tool_calls
+
         return session_config
 
     def _create_client(self) -> AsyncOpenAI:
@@ -269,7 +265,7 @@ class OpenAIRealtimeAssistantServer(AbstractAssistantServer):
                         "content": [
                             {
                                 "type": "input_text",
-                                "text": f"Say: '{INITIAL_MESSAGE}'",
+                                "text": f"Say: '{self.initial_message}'",
                             }
                         ],
                     }
@@ -639,7 +635,7 @@ class OpenAIRealtimeAssistantServer(AbstractAssistantServer):
         except json.JSONDecodeError:
             arguments = {}
 
-        logger.info(f"Tool call: {func_name}({json.dumps(arguments)})")
+        logger.info(f"Tool call: {func_name}({json.dumps(arguments, ensure_ascii=False)})")
         self._assistant_state.has_function_calls = True
 
         # Execute tool and record in audit log
@@ -661,7 +657,7 @@ class OpenAIRealtimeAssistantServer(AbstractAssistantServer):
             item={
                 "type": "function_call_output",
                 "call_id": call_id,
-                "output": json.dumps(result),
+                "output": json.dumps(result, ensure_ascii=False),
             }
         )
 
